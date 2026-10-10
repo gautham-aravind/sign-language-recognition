@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+dataset/
+tf_gpu_check.txt
+models/*.keras
+!models/augstrong_seed44.keras
+!models/augmented_seed43.keras
