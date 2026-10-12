@@ -1,69 +1,97 @@
+"""Real-time static ASL demo: crop a fixed box from the webcam, classify it, smooth over a few frames.
+
+Run from anywhere:  python webcam/webcam.py   (add --model PATH to use a different .keras file)
+The default model is models/augstrong_seed44.keras in this repository, found relative to this file.
+"""
+import argparse
+import sys
 import time
-from collections import Counter, deque
+from pathlib import Path
 
 import cv2
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras import layers
 
-MODEL_PATH = "augstrong_seed44.keras"   # copy from ../models/
-CLASSES = [str(i) for i in range(10)] + [chr(c) for c in range(ord("A"), ord("Z") + 1)]
-THRESHOLD = 0.45   # below this confidence the frame votes "?"
-WINDOW = 7         # majority vote over the last N frames
-BOX = 300          # side of the square capture box, in pixels
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))   # so `from src...` works wherever the script is launched from
 
+from src.data import CLASSES                                              # noqa: E402
+from src.inference import (BOX, THRESHOLD, WINDOW, MajorityVoteSmoother,  # noqa: E402
+                           box_origin, crop_center, predict_probs)
 
-class WebcamStyleAugment(layers.Layer):
-    # Training-only augmentation layer; identity at prediction time, so a pass-through stub is exact.
-    def call(self, x, training=None):
-        return x
+DEFAULT_MODEL = REPO_ROOT / "models" / "augstrong_seed44.keras"
 
 
-model = tf.keras.models.load_model(MODEL_PATH, custom_objects={"WebcamStyleAugment": WebcamStyleAugment})
+def load_model(model_path):
+    """Load the saved Keras model. TensorFlow is imported here so importing this file stays light."""
+    import tensorflow as tf
+    from tensorflow.keras import layers
 
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    raise SystemExit("Could not open camera 0 (try index 1 if a virtual camera is taking slot 0)")
+    class WebcamStyleAugment(layers.Layer):
+        # Training-only augmentation layer; identity at prediction time, so a pass-through stub is exact.
+        def call(self, x, training=None):
+            return x
 
-recent = deque(maxlen=WINDOW)
-prev = time.time()
-fps = 0.0
+    return tf.keras.models.load_model(model_path, custom_objects={"WebcamStyleAugment": WebcamStyleAugment})
 
-while True:
-    ok, frame = cap.read()
-    if not ok:
-        break
-    h, w = frame.shape[:2]
-    x0, y0 = (w - BOX) // 2, (h - BOX) // 2
-    crop = frame[y0:y0 + BOX, x0:x0 + BOX]
 
-    # Same preprocessing as training: OpenCV gives BGR, the model was trained on RGB.
-    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-    x = cv2.resize(rgb, (128, 128)).astype("float32") / 255.0
-    probs = model.predict(x[None], verbose=0)[0]
-    best = int(np.argmax(probs))
-    recent.append(best if probs[best] >= THRESHOLD else -1)
-
-    vote, count = Counter(recent).most_common(1)[0]
-    label = CLASSES[vote] if vote >= 0 and count >= WINDOW // 2 + 1 else "?"
-
-    now = time.time()
-    fps = 0.9 * fps + 0.1 * (1.0 / max(now - prev, 1e-6))
-    prev = now
-
-    # Mirror the display only; the model sees the unflipped crop.
-    shown = cv2.flip(frame, 1)
-    sx0 = w - (x0 + BOX)
+def draw_overlay(frame, result, probs, fps, frame_w, x0, y0):
+    """Mirror the frame for display and draw the box, smoothed label, FPS and current top-3."""
+    shown = cv2.flip(frame, 1)   # mirror for display only; the model sees the unflipped crop
+    sx0 = frame_w - (x0 + BOX)
     cv2.rectangle(shown, (sx0, y0), (sx0 + BOX, y0 + BOX), (0, 255, 0), 2)
-    cv2.putText(shown, f"{label}  ({probs[best]:.2f})", (20, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 0), 3)
-    cv2.putText(shown, f"{fps:.1f} FPS", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-    top3 = np.argsort(probs)[::-1][:3]
-    cv2.putText(shown, "  ".join(f"{CLASSES[i]}:{probs[i]:.2f}" for i in top3),
-                (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
-    cv2.imshow("Sign recognition (q to quit)", shown)
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
 
-cap.release()
-cv2.destroyAllWindows()
+    # The label and number come from the same smoothed result: confidence is the mean probability over the
+    # frames that voted for this label. When the vote is uncertain, only "?" is shown.
+    text = "?" if result.index is None else f"{result.label}  (avg {result.confidence:.2f})"
+    cv2.putText(shown, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 0), 3)
+    cv2.putText(shown, f"{fps:.1f} FPS", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+
+    # Raw single-frame probabilities, labelled as such: these may disagree with the smoothed label.
+    top3 = np.argsort(probs)[::-1][:3]
+    cv2.putText(shown, "now: " + "  ".join(f"{CLASSES[i]}:{probs[i]:.2f}" for i in top3),
+                (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+    return shown
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Real-time static ASL recognition demo")
+    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL, help=f"path to a .keras model (default: {DEFAULT_MODEL})")
+    parser.add_argument("--camera", type=int, default=0, help="camera index (try 1 if a virtual camera takes slot 0)")
+    args = parser.parse_args(argv)
+
+    if not args.model.exists():
+        raise SystemExit(f"Model not found: {args.model}\nRun from a full clone of the repository, or pass --model PATH.")
+    model = load_model(args.model)
+
+    cap = cv2.VideoCapture(args.camera)
+    if not cap.isOpened():
+        raise SystemExit(f"Could not open camera {args.camera} (try --camera 1 if a virtual camera is taking slot 0)")
+
+    smoother = MajorityVoteSmoother(WINDOW, THRESHOLD)
+    prev = time.time()
+    fps = 0.0
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        h, w = frame.shape[:2]
+        x0, y0 = box_origin(w, h, BOX)
+
+        probs = predict_probs(model, crop_center(frame, BOX))
+        result = smoother.update(probs)
+
+        now = time.time()
+        fps = 0.9 * fps + 0.1 * (1.0 / max(now - prev, 1e-6))
+        prev = now
+
+        cv2.imshow("Sign recognition (q to quit)", draw_overlay(frame, result, probs, fps, w, x0, y0))
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

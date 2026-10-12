@@ -71,15 +71,36 @@ background** plus a 0.45 threshold, A, L, 5, O and Y were all recognised. This i
 accuracy. With the 0.45 threshold, an empty box still showed "?" (no false letter). The dataset-to-webcam gap (camera quality, lighting, background) is the main open problem. Speed was
 about 12 FPS on CPU.
 
+Setup (from the repository root, after cloning the full repo so `models/` is present). On Windows (PowerShell):
+
 ```
-cd webcam
-python -m venv .venv && .venv\Scripts\activate      # Windows
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
-python webcam.py
+python webcam\webcam.py
 ```
 
+On Linux / macOS:
+
+```
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python webcam/webcam.py
+```
+
+Press `q` in the video window to quit. Notes:
+- **Model file:** the demo loads `models/augstrong_seed44.keras`, found relative to `webcam/webcam.py` (not the current
+  directory), so it works from any folder. Use `--model path/to/other.keras` for a different model and `--camera 1` if
+  a virtual camera takes slot 0.
+- **On screen:** the large text is the 7-frame majority-vote sign with its **average confidence over the frames that
+  voted for it**; `?` means no sign has a majority of confident frames. The smaller `now:` line shows the raw top-3
+  probabilities of the current frame only, so it can differ from the voted sign.
+- **WSL2** usually cannot see a USB webcam, so I ran the demo with a normal Windows Python environment (CPU TensorFlow).
+  Only the Windows setup above has been tried on my machine; the Linux/macOS commands are untested.
+
 Models in `models/`: `augmented_seed43.keras` (final P10-tested model) and `augstrong_seed44.keras` (used in the demo).
-`augstrong` contains a custom layer, handled by the stub class in `webcam.py`.
+`augstrong` contains a custom layer, handled by the stub class in `webcam/webcam.py`.
 
 ## Repository layout
 
@@ -87,10 +108,31 @@ Models in `models/`: `augmented_seed43.keras` (final P10-tested model) and `augs
 notebooks/
   01_dataset_exploration.ipynb   raw lab notebook (all experiments, with outputs)
   03_final_experiments.ipynb     cleaned, safe-to-run-all version
+src/
+  data.py                        class list, participant-based split (plain Python)
+  inference.py                   webcam crop, preprocessing and majority-vote smoothing
+tests/                           unit tests (see "Tests" below)
 experiments/                     per-run settings and per-epoch history (JSON)
 models/                          the two published models
 webcam/                          real-time demo
+.github/workflows/tests.yml      runs the tests on every push and pull request
 ```
+
+The model, augmentation layers, `tf.data` pipeline and training/bookkeeping code are still defined inside
+`03_final_experiments.ipynb`. They need TensorFlow to check, so they were not moved.
+
+## Tests
+
+```
+pip install numpy opencv-python-headless    # or: pip install -r requirements.txt
+python -m unittest discover -s tests -t . -v
+```
+
+The tests need no dataset, GPU, webcam or TensorFlow. **Covered:** class order (0-9 then A-Z), participant split logic
+(on temporary placeholder files), webcam crop and preprocessing (BGR to RGB, 128x128, 0-1), the majority-vote smoother
+(threshold, window, which class the confidence belongs to), the webcam script's default model path, and that importing it
+never opens the camera. **Not covered:** model training or accuracy, the TensorFlow data pipeline, loading the real
+`.keras` files, a real camera, and the notebook as a whole.
 
 ## Reproducing
 
